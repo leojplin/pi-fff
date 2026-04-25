@@ -17,6 +17,7 @@ import { Text, type AutocompleteItem, type AutocompleteProvider, type Autocomple
 import { Type } from "@sinclair/typebox";
 import { FileFinder } from "@ff-labs/fff-node";
 import type { GrepCursor, GrepMode, GrepResult, SearchResult } from "@ff-labs/fff-node";
+import { DaemonFileFinder, isDaemonAvailable } from "./daemon-client.js";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 
@@ -35,6 +36,18 @@ const GREP_MAX_LINE_LENGTH = 500;
 const MENTION_MAX_RESULTS = 20;
 
 type FffMode = "both" | "tools-only";
+
+type FffConfig = {
+	mode?: string;
+	daemonFallback?: boolean;
+	watchGitEvents?: boolean;
+};
+
+const DEFAULT_CONFIG = {
+	mode: "tools-only" as FffMode,
+	daemonFallback: false,
+	watchGitEvents: false,
+};
 
 // ---------------------------------------------------------------------------
 // Cursor store — maps opaque IDs to GrepCursor values across tool calls
@@ -189,9 +202,12 @@ class FffEditor extends CustomEditor {
 // Extension
 // ---------------------------------------------------------------------------
 
+type AnyFinder = FileFinder | DaemonFileFinder;
+
 export default function fffExtension(pi: ExtensionAPI) {
-	let finder: FileFinder | null = null;
+	let finder: AnyFinder | null = null;
 	let finderCwd: string | null = null;
+	let finderIsDaemon = false;
 	let activeCwd = process.cwd();
 	const cursorStore = new CursorStore();
 
@@ -202,22 +218,44 @@ export default function fffExtension(pi: ExtensionAPI) {
 	}
 
 	function normalizeMode(value: string | undefined): FffMode {
-		return value === "tools-only" ? "tools-only" : "both";
+		return value === "both" ? "both" : "tools-only";
 	}
 
-	function readConfigMode(): FffMode {
-		try {
-			if (!existsSync(CONFIG_PATH)) return "both";
-			const parsed = JSON.parse(readFileSync(CONFIG_PATH, "utf8")) as { mode?: string };
-			return normalizeMode(parsed.mode);
-		} catch {
-			return "both";
+	function parseBoolean(value: unknown): boolean | undefined {
+		if (typeof value === "boolean") return value;
+		if (typeof value === "number") return value !== 0;
+		if (typeof value !== "string") return undefined;
+
+		switch (value.trim().toLowerCase()) {
+			case "1":
+			case "true":
+			case "yes":
+			case "on":
+				return true;
+			case "0":
+			case "false":
+			case "no":
+			case "off":
+				return false;
+			default:
+				return undefined;
 		}
 	}
 
-	function writeConfigMode(mode: FffMode): void {
+	function readConfig(): FffConfig {
 		try {
-			writeFileSync(CONFIG_PATH, JSON.stringify({ mode }, null, 2), "utf8");
+			if (!existsSync(CONFIG_PATH)) return {};
+			const parsed = JSON.parse(readFileSync(CONFIG_PATH, "utf8")) as FffConfig;
+			return parsed && typeof parsed === "object" ? parsed : {};
+		} catch {
+			return {};
+		}
+	}
+
+	function writeConfigPatch(patch: Partial<FffConfig>): void {
+		try {
+			const current = readConfig();
+			writeFileSync(CONFIG_PATH, JSON.stringify({ ...current, ...patch }, null, 2), "utf8");
 		} catch {
 			// ignore
 		}
@@ -231,15 +269,62 @@ export default function fffExtension(pi: ExtensionAPI) {
 		if (process.env.PI_FFF_MODE) {
 			return normalizeMode(process.env.PI_FFF_MODE);
 		}
-		return readConfigMode();
+		return normalizeMode(readConfig().mode) ?? DEFAULT_CONFIG.mode;
 	}
 
-	async function ensureFinder(cwd: string): Promise<FileFinder> {
+	function getDaemonFallback(): boolean {
+		const flag = parseBoolean(pi.getFlag("fff-daemon-fallback"));
+		if (flag !== undefined) return flag;
+		const env = parseBoolean(process.env.PI_FFF_DAEMON_FALLBACK);
+		if (env !== undefined) return env;
+		const config = parseBoolean(readConfig().daemonFallback);
+		return config ?? DEFAULT_CONFIG.daemonFallback;
+	}
+
+	function getWatchGitEvents(): boolean {
+		const flag = parseBoolean(pi.getFlag("fff-watch-git-events"));
+		if (flag !== undefined) return flag;
+		const env = parseBoolean(process.env.PI_FFF_WATCH_GIT_EVENTS);
+		if (env !== undefined) return env;
+		const config = parseBoolean(readConfig().watchGitEvents);
+		return config ?? DEFAULT_CONFIG.watchGitEvents;
+	}
+
+	async function ensureFinder(cwd: string): Promise<AnyFinder> {
 		if (finder && !finder.isDestroyed && finderCwd === cwd) return finder;
 		if (finder && !finder.isDestroyed && finderCwd !== cwd) {
 			finder.destroy();
 			finder = null;
 			finderCwd = null;
+			finderIsDaemon = false;
+		}
+
+		const daemonFallback = getDaemonFallback();
+		const watchGitEvents = getWatchGitEvents();
+
+		// Try daemon mode first — shares index with Neovim and other pi sessions
+		if (isDaemonAvailable()) {
+			const daemonResult = await DaemonFileFinder.tryCreate({
+				basePath: cwd,
+				frecencyDbPath: FRECENCY_DB_PATH,
+				historyDbPath: HISTORY_DB_PATH,
+				watchGitEvents,
+			});
+			if (daemonResult.ok) {
+				finder = daemonResult.value;
+				finderCwd = cwd;
+				finderIsDaemon = true;
+				const scanResult = await finder.waitForScan(15000);
+				if (scanResult.ok && !scanResult.value) {
+					// timed out but finder is still usable with partial index
+				}
+				return finder;
+			}
+			if (!daemonFallback) {
+				throw new Error(`FFF daemon init failed and fallback is disabled: ${daemonResult.error}`);
+			}
+		} else if (!daemonFallback) {
+			throw new Error("FFF daemon socket not found and fallback is disabled");
 		}
 
 		const result = FileFinder.create({
@@ -255,6 +340,7 @@ export default function fffExtension(pi: ExtensionAPI) {
 
 		finder = result.value;
 		finderCwd = cwd;
+		finderIsDaemon = false;
 		const scanResult = await finder.waitForScan(15000);
 		if (scanResult.ok && !scanResult.value) {
 			// timed out but finder is still usable with partial index
@@ -303,8 +389,20 @@ export default function fffExtension(pi: ExtensionAPI) {
 	// --- Flags / lifecycle ---
 
 	pi.registerFlag("fff-mode", {
-		description: "FFF mode: both or tools-only (overrides config/env when provided)",
+		description: "FFF mode: both or tools-only (default: tools-only; overrides config/env when provided)",
 		type: "string",
+	});
+
+	pi.registerFlag("fff-daemon-fallback", {
+		description: "Allow fallback to in-process FFF when daemon is unavailable (default: false)",
+		type: "boolean",
+		default: DEFAULT_CONFIG.daemonFallback,
+	});
+
+	pi.registerFlag("fff-watch-git-events", {
+		description: "Enable daemon-side git event watching (default: false)",
+		type: "boolean",
+		default: DEFAULT_CONFIG.watchGitEvents,
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -732,9 +830,37 @@ export default function fffExtension(pi: ExtensionAPI) {
 				ctx.ui.notify("Usage: /fff-mode both | tools-only", "warning");
 				return;
 			}
-			writeConfigMode(raw);
+			writeConfigPatch({ mode: raw });
 			applyEditorMode(ctx);
 			ctx.ui.notify(`FFF mode set to '${raw}'`, "info");
+		},
+	});
+
+	pi.registerCommand("fff-daemon-fallback", {
+		description: "Set daemon fallback: /fff-daemon-fallback on | off",
+		handler: async (args, ctx) => {
+			const value = parseBoolean((args || "").trim());
+			if (value === undefined) {
+				ctx.ui.notify("Usage: /fff-daemon-fallback on | off", "warning");
+				return;
+			}
+			writeConfigPatch({ daemonFallback: value });
+			destroyFinder();
+			ctx.ui.notify(`FFF daemon fallback ${value ? "enabled" : "disabled"}` + (value ? "" : " (hard-fail mode)"), "info");
+		},
+	});
+
+	pi.registerCommand("fff-watch-git-events", {
+		description: "Set daemon git watching: /fff-watch-git-events on | off",
+		handler: async (args, ctx) => {
+			const value = parseBoolean((args || "").trim());
+			if (value === undefined) {
+				ctx.ui.notify("Usage: /fff-watch-git-events on | off", "warning");
+				return;
+			}
+			writeConfigPatch({ watchGitEvents: value });
+			destroyFinder();
+			ctx.ui.notify(`FFF daemon git event watching ${value ? "enabled" : "disabled"}`, "info");
 		},
 	});
 
@@ -756,6 +882,9 @@ export default function fffExtension(pi: ExtensionAPI) {
 			const lines = [
 				`FFF v${h.version}`,
 				`Mode: ${getMode()}`,
+				`Backend: ${finderIsDaemon ? "daemon" : "in-process"}`,
+				`Daemon fallback: ${getDaemonFallback() ? "enabled" : "disabled"}`,
+				`Watch git events: ${getWatchGitEvents() ? "enabled" : "disabled"}`,
 				`Git: ${h.git.repositoryFound ? `yes (${h.git.workdir ?? "unknown"})` : "no"}`,
 				`Picker: ${h.filePicker.initialized ? `${h.filePicker.indexedFiles ?? 0} files` : "not initialized"}`,
 				`Frecency: ${h.frecency.initialized ? "active" : "disabled"}`,

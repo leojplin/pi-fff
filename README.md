@@ -9,7 +9,7 @@ A [pi](https://github.com/badlogic/pi-mono) extension that replaces the built-in
 | `find` (spawns `fd`) | `find` (FFF `fileSearch`) | Fuzzy matching, frecency ranking, git-aware, pre-indexed |
 | `grep` (spawns `rg`) | `grep` (FFF `grep`) | SIMD-accelerated, frecency-ordered, mmap-cached, no subprocess |
 | *(none)* | `multi_grep` (FFF `multiGrep`) | OR-logic multi-pattern search via Aho-Corasick |
-| `@` file autocomplete (fd-backed) | `@` file autocomplete (FFF-backed, default) | Fuzzy ranking from FFF index/frecency |
+| `@` file autocomplete (fd-backed) | `@` file autocomplete (FFF-backed, optional) | Fuzzy ranking from FFF index/frecency |
 
 ### Key advantages over built-in tools
 
@@ -115,17 +115,46 @@ Parameters:
 - `/fff-health` — show FFF status (indexed files, git info, frecency/history DB status)
 - `/fff-rescan` — trigger a file rescan
 - `/fff-mode both|tools-only` — switch mode and persist it
+- `/fff-daemon-fallback on|off` — allow or prevent fallback to in-process FFF
+- `/fff-watch-git-events on|off` — enable or disable daemon-side git event watching
 
 ## Modes
 
-- `both` (default): tool overrides + `@` autocomplete replacement in UI
-- `tools-only`: only tool overrides; keep pi's default fd-backed `@` autocomplete
+- `tools-only` (default): only tool overrides; keep pi's default fd-backed `@` autocomplete
+- `both`: tool overrides + `@` autocomplete replacement in UI
 
 Mode precedence:
 1. `--fff-mode <mode>` CLI flag
 2. `PI_FFF_MODE=<mode>` environment variable
 3. persisted config (`~/.pi/agent/fff/config.json`)
-4. default (`both`)
+4. default (`tools-only`)
+
+## Configuration
+
+These settings can be controlled via CLI flags, environment variables, or `~/.pi/agent/fff/config.json`:
+
+- `mode`
+  - flag: `--fff-mode both|tools-only`
+  - env: `PI_FFF_MODE`
+  - default: `tools-only`
+- `daemonFallback`
+  - flag: `--fff-daemon-fallback`
+  - env: `PI_FFF_DAEMON_FALLBACK`
+  - default: `false` (hard-fail if daemon is unavailable)
+- `watchGitEvents`
+  - flag: `--fff-watch-git-events`
+  - env: `PI_FFF_WATCH_GIT_EVENTS`
+  - default: `false`
+
+Example config:
+
+```json
+{
+  "mode": "tools-only",
+  "daemonFallback": false,
+  "watchGitEvents": false
+}
+```
 
 ## Data
 
